@@ -1,0 +1,126 @@
+[
+  {
+    "id": 1,
+    "question": "What are your customer support operating hours?",
+    "expected_intent": "FAQ",
+    "should_escalate": false
+  },
+  {
+    "id": 2,
+    "question": "Do you offer student or military discounts?",
+    "expected_intent": "FAQ",
+    "should_escalate": false
+  },
+  {
+    "id": 3,
+    "question": "What is the battery life of the TechPro Wireless Headphones?",
+    "expected_intent": "PRODUCT",
+    "should_escalate": false
+  },
+  {
+    "id": 4,
+    "question": "Is the SmartFit Watch Ultra waterproof for swimming?",
+    "expected_intent": "PRODUCT",
+    "should_escalate": false
+  },
+  {
+    "id": 5,
+    "question": "How much does the SmartFit Watch Ultra cost?",
+    "expected_intent": "PRICING",
+    "should_escalate": false
+  },
+  {
+    "id": 6,
+    "question": "What is the price of Product A?",
+    "expected_intent": "PRICING",
+    "should_escalate": false
+  },
+  {
+    "id": 7,
+    "question": "Can I get a refund if I cancel my order within 30 days?",
+    "expected_intent": "REFUND",
+    "should_escalate": false
+  },
+  {
+    "id": 8,
+    "question": "Are engraved items eligible for a full return and refund?",
+    "expected_intent": "REFUND",
+    "should_escalate": false
+  },
+  {
+    "id": 9,
+    "question": "How long does standard ground shipping take?",
+    "expected_intent": "SHIPPING",
+    "should_escalate": false
+  },
+  {
+    "id": 10,
+    "question": "Is shipping free on orders over $50?",
+    "expected_intent": "SHIPPING",
+    "should_escalate": false
+  },
+  {
+    "id": 11,
+    "question": "Why did my credit card payment get declined at checkout?",
+    "expected_intent": "TROUBLESHOOTING",
+    "should_escalate": false
+  },
+  {
+    "id": 12,
+    "question": "How long will my account be locked after failed login attempts?",
+    "expected_intent": "TROUBLESHOOTING",
+    "should_escalate": false
+  },
+  {
+    "id": 13,
+    "question": "Where is my order ORD123 right now?",
+    "expected_intent": "ORDER_STATUS",
+    "should_escalate": false,
+    "expected_tool": "get_order_status"
+  },
+  {
+    "id": 14,
+    "question": "What is the current status of order ORD456?",
+    "expected_intent": "ORDER_STATUS",
+    "should_escalate": false,
+    "expected_tool": "get_order_status"
+  },
+  {
+    "id": 15,
+    "question": "Please cancel my order ORD456.",
+    "expected_intent": "CANCEL_ORDER",
+    "should_escalate": false,
+    "expected_tool": "cancel_order"
+  },
+  {
+    "id": 16,
+    "question": "Can I cancel my shipped order ORD123?",
+    "expected_intent": "CANCEL_ORDER",
+    "should_escalate": false,
+    "expected_tool": "cancel_order"
+  },
+  {
+    "id": 17,
+    "question": "This service is terrible and I am very angry!",
+    "expected_intent": "COMPLAINT",
+    "should_escalate": true
+  },
+  {
+    "id": 18,
+    "question": "I want to speak to a human customer support agent right now.",
+    "expected_intent": "HUMAN_ESCALATION",
+    "should_escalate": true
+  },
+  {
+    "id": 19,
+    "question": "Can I speak to a real manager?",
+    "expected_intent": "HUMAN_ESCALATION",
+    "should_escalate": true
+  },
+  {
+    "id": 20,
+    "question": "What is the capital city of France?",
+    "expected_intent": "GENERAL",
+    "should_escalate": false
+  }
+]

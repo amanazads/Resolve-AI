@@ -1,0 +1,55 @@
+version: '3.8'
+
+services:
+  mongodb:
+    image: mongo:latest
+    container_name: ai_support_mongodb
+    restart: always
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+    networks:
+      - ai_support_net
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: ai_support_backend
+    restart: always
+    ports:
+      - "8000:8000"
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - MONGODB_URI=mongodb://mongodb:27017
+      - MONGODB_DB_NAME=ai_support_db
+      - CHROMA_PERSIST_DIRECTORY=./chroma_db
+      - LLM_MODEL=gemini-2.5-flash
+    volumes:
+      - ./chroma_db:/app/chroma_db
+      - ./knowledge_base:/app/knowledge_base
+    depends_on:
+      - mongodb
+    networks:
+      - ai_support_net
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.frontend
+    container_name: ai_support_frontend
+    restart: always
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    networks:
+      - ai_support_net
+
+volumes:
+  mongodb_data:
+
+networks:
+  ai_support_net:
+    driver: bridge
