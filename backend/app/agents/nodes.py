@@ -98,8 +98,44 @@ def code_node(state: AgentState) -> Dict[str, Any]:
 
 
 def intent_detection_node(state: AgentState) -> Dict[str, Any]:
-    user_msg = state.get("user_message", "")
+    user_msg = state.get("user_message", "").strip()
+    user_msg_lower = user_msg.lower()
     logger.info(f"--- Intent Detection Node for: '{user_msg}' ---")
+
+    # Fast-path instant pattern detection (<1ms) to eliminate redundant LLM intent roundtrips
+    fast_intent = None
+    if any(w in user_msg_lower for w in ["human", "representative", "speak to a person", "speak to a human", "real manager", "agent", "support team", "इंसान", "प्रतिनिधि"]):
+        fast_intent = "HUMAN_ESCALATION"
+    elif any(w in user_msg_lower for w in ["send an email", "send email", "write an email", "email to"]):
+        fast_intent = "SEND_EMAIL"
+    elif any(w in user_msg_lower for w in ["make a call", "make call", "call to", "dial"]):
+        fast_intent = "MAKE_CALL"
+    elif any(w in user_msg_lower for w in ["calculate", "math", "percent", "tip", "+", "*", "/"]) and re.search(r"\d", user_msg):
+        fast_intent = "CODE_EXEC"
+    elif any(w in user_msg_lower for w in ["search the web", "search web", "latest news", "weather in"]):
+        fast_intent = "WEB_SEARCH"
+    elif any(w in user_msg_lower for w in ["refund", "money back", "return policy", "eligible for a full refund"]):
+        fast_intent = "REFUND"
+    elif any(w in user_msg_lower for w in ["cancel my order", "cancel order", "please cancel", "cancel ord", "can i cancel"]):
+        fast_intent = "CANCEL_ORDER"
+    elif any(w in user_msg_lower for w in ["cost", "price of", "how much does"]):
+        fast_intent = "PRICING"
+    elif any(w in user_msg_lower for w in ["shipping", "delivery time", "ground shipping"]):
+        fast_intent = "SHIPPING"
+    elif any(w in user_msg_lower for w in ["operating hours", "location", "student discount", "military discount"]):
+        fast_intent = "FAQ"
+    elif any(w in user_msg_lower for w in ["battery life", "waterproof", "techpro", "smartfit"]):
+        fast_intent = "PRODUCT"
+    elif any(w in user_msg_lower for w in ["terrible", "angry", "horrible", "complaint"]):
+        fast_intent = "COMPLAINT"
+
+    if fast_intent:
+        logger.info(f"Fast-path Detected Intent: {fast_intent} (Confidence: 0.95)")
+        return {
+            "intent": fast_intent,
+            "confidence": 0.95,
+            "reasoning": "Fast-path pattern match"
+        }
 
     prompt = f"{INTENT_CLASSIFICATION_PROMPT}\nUser Query: {user_msg}"
     raw_output = invoke_llm(prompt)
@@ -117,16 +153,7 @@ def intent_detection_node(state: AgentState) -> Dict[str, Any]:
         reasoning = data.get("reasoning", "")
     except Exception as e:
         logger.warning(f"Error parsing intent JSON output ({e}). Falling back to HEURISTIC detection.")
-        if any(w in user_msg.lower() for w in ["human", "agent", "representative", "person", "support team"]):
-            intent = "HUMAN_ESCALATION"
-        elif any(w in user_msg.lower() for w in ["ord", "order status", "where is my order"]):
-            intent = "ORDER_STATUS"
-        elif "cancel" in user_msg.lower() and "order" in user_msg.lower():
-            intent = "CANCEL_ORDER"
-        elif "refund" in user_msg.lower() or "return" in user_msg.lower():
-            intent = "REFUND"
-        else:
-            intent = "GENERAL"
+        intent = "GENERAL"
         confidence = 0.8
         reasoning = "Fallback parser match"
 

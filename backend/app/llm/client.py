@@ -3,7 +3,9 @@ import re
 import json
 import logging
 
+from functools import lru_cache
 from typing import Dict, Any, Optional
+
 try:
     from app.config import settings
 except ImportError:
@@ -11,6 +13,7 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+@lru_cache(maxsize=1)
 def get_llm():
     """
     Returns ChatGoogleGenerativeAI instance if GEMINI_API_KEY is available.

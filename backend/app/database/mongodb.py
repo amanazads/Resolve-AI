@@ -27,13 +27,14 @@ class MongoDBManager:
         try:
             self.client = motor.motor_asyncio.AsyncIOMotorClient(
                 settings.MONGODB_URI,
-                serverSelectionTimeoutMS=2000
+                serverSelectionTimeoutMS=5000,
+                connectTimeoutMS=5000
             )
             # Test connection
             await self.client.admin.command('ping')
             self.db = self.client[settings.MONGODB_DB_NAME]
             self.is_connected = True
-            logger.info(f"Connected to MongoDB at {settings.MONGODB_URI}")
+            logger.info(f"Connected to MongoDB Atlas database '{settings.MONGODB_DB_NAME}' successfully.")
         except Exception as e:
             self.is_connected = False
             logger.warning(f"MongoDB not reachable ({e}). Operating with in-memory persistence fallback.")
