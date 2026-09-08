@@ -6,6 +6,7 @@ import ChatMessage from './components/ChatMessage';
 import ChatInput from './components/ChatInput';
 import AgentInspector from './components/AgentInspector';
 import SupportWidget from './components/SupportWidget';
+import WorkspaceShell from './components/workspace/WorkspaceShell';
 import { sendChatMessage, escalateSession } from './services/api';
 import { useVoice } from './hooks/useVoice';
 
@@ -18,6 +19,13 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [isEscalated, setIsEscalated] = useState(false);
   
+  /*
+   * The app has two surfaces. 'workspace' is the automation product; 'chat' is
+   * the original support assistant, unchanged. Neither replaces the other -- the
+   * mode switch is the only thing between them.
+   */
+  const [mode, setMode] = useState('workspace');
+
   // Layout states
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [inspectorOpen, setInspectorOpen] = useState(false);
@@ -138,6 +146,14 @@ export default function App() {
     setActiveSpeechIdx(null);
   };
 
+  if (mode === 'workspace') {
+    return (
+      <div className="app-frame">
+        <WorkspaceShell onOpenAssistant={() => setMode('chat')} />
+      </div>
+    );
+  }
+
   // If in Floating Widget Mode demo
   if (isWidgetMode) {
     return (
@@ -184,6 +200,7 @@ export default function App() {
         onToggle={() => setSidebarOpen(!sidebarOpen)}
         onNewChat={handleNewSession}
         sessionId={sessionId}
+        onOpenWorkspace={() => setMode('workspace')}
       />
 
       <main className="main-chat-container">

@@ -2,6 +2,10 @@ import os
 import logging
 from typing import List, Tuple
 try:
+    from langchain_core.documents import Document
+except ImportError:  # pragma: no cover - optional dependency layout
+    from langchain.schema import Document
+try:
     from langchain_chroma import Chroma
 except ImportError:
     from langchain_community.vectorstores import Chroma

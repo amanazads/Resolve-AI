@@ -1,11 +1,12 @@
 import React from 'react';
-import { Plus, MessageSquare, PanelLeftClose, User } from 'lucide-react';
+import { Plus, MessageSquare, PanelLeftClose, User, LayoutDashboard } from 'lucide-react';
 
 export default function Sidebar({ 
   isOpen, 
   onToggle, 
   onNewChat, 
-  sessionId 
+  sessionId,
+  onOpenWorkspace
 }) {
   return (
     <aside className={`sidebar ${isOpen ? '' : 'collapsed'}`}>
@@ -30,6 +31,12 @@ export default function Sidebar({
           <Plus size={15} />
           <span>New Conversation</span>
         </button>
+        {onOpenWorkspace ? (
+          <button className="btn-workspace-switch" onClick={onOpenWorkspace}>
+            <LayoutDashboard size={15} />
+            <span>Automation workspace</span>
+          </button>
+        ) : null}
       </div>
 
       <div className="conversations-history">

@@ -15,7 +15,13 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 from app.database.mongodb import db_manager
-from app.api.routes import chat, health
+from app.api.routes import chat, health, automation, contacts
+from app.campaigns import router as campaigns_router
+from app.tasks import tasks_router
+from app.integrations.gmail.routes import router as gmail_router
+from app.permissions.routes import router as permissions_router
+from app.automation.campaign_service import campaign_service
+from app.automation.worker import campaign_execution_service
 
 # Configure Logging
 logging.basicConfig(
@@ -28,8 +34,23 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     logger.info("Initializing application resources...")
     await db_manager.connect()
+    # Recover any stale or in-flight jobs from previous server restarts
+    try:
+        await campaign_service.recover_from_restart()
+    except Exception as e:
+        logger.warning(f"Error during startup crash recovery: {e}")
+    # Reclaim campaign jobs orphaned by a worker that died, and resume any
+    # campaign that was still RUNNING when this process last stopped.
+    try:
+        await campaign_execution_service.recover_on_startup()
+    except Exception as e:
+        logger.warning(f"Error during campaign execution recovery: {e}")
     yield
     logger.info("Shutting down application resources...")
+    try:
+        await campaign_execution_service.shutdown()
+    except Exception as e:
+        logger.warning(f"Error stopping campaign workers: {e}")
     await db_manager.close()
 
 app = FastAPI(
@@ -50,6 +71,12 @@ app.add_middleware(
 # Register API Routers
 app.include_router(health.router, prefix=settings.API_PREFIX, tags=["Health"])
 app.include_router(chat.router, prefix=settings.API_PREFIX, tags=["Chat"])
+app.include_router(automation.router, prefix=settings.API_PREFIX, tags=["Automation"])
+app.include_router(contacts.router, prefix=settings.API_PREFIX, tags=["Contacts"])
+app.include_router(campaigns_router, prefix=settings.API_PREFIX, tags=["Campaigns"])
+app.include_router(tasks_router, prefix=settings.API_PREFIX, tags=["Tasks"])
+app.include_router(gmail_router, prefix=settings.API_PREFIX)
+app.include_router(permissions_router, prefix=settings.API_PREFIX, tags=["Permissions & Audit"])
 
 @app.get("/")
 async def root():
