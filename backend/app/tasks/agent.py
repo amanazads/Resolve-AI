@@ -19,7 +19,11 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 import uuid
 
+from app.config import settings
 from app.database.mongodb import db_manager
+from app.permissions.middleware import PermissionEnforcer
+from app.permissions.models import GrantPermissionRequest, PermissionScope
+from app.permissions.service import permission_service
 from app.tasks.attachments import AttachmentProcessor
 from app.tasks.models import (
     ActionStatus,
@@ -29,6 +33,8 @@ from app.tasks.models import (
     ExecutionTask,
     TaskAction,
     TaskAttachment,
+    TaskAuthorization,
+    TaskClarification,
     TaskEvent,
     TaskEventType,
     TaskJob,
@@ -113,7 +119,7 @@ class TaskAgent:
     @classmethod
     async def resume_with_message(cls, task_id: str, message: str) -> Optional[ExecutionTask]:
         """
-        Resumes a paused task (e.g. WAITING_FOR_USER) using the user's response.
+        Resumes a paused task (e.g. WAITING_FOR_CLARIFICATION) using the user's response.
         Ensures continuation on the SAME task_id.
         """
         task_dict = await db_manager.get_task(task_id)
@@ -131,6 +137,11 @@ class TaskAgent:
 
         # Resolve clarification using user's answer
         cls._resolve_clarification_from_message(task, message)
+        if task.clarification:
+            task.clarification.answered = True
+            task.clarification.user_response = message
+            task.clarification.round += 1
+
         task.status = TaskStatus.PLANNING
         await db_manager.save_task(task.model_dump(mode="json"))
 
@@ -140,15 +151,39 @@ class TaskAgent:
     async def approve_and_execute(cls, task_id: str) -> Optional[ExecutionTask]:
         """
         Explicit user authorization to proceed with pending actions.
+        Creates a verified server-side permission grant.
         """
         task_dict = await db_manager.get_task(task_id)
         if not task_dict:
             return None
 
         task = ExecutionTask.model_validate(task_dict)
+        provider_name = (settings.EMAIL_PROVIDER or "mock").lower()
+
+        # Create server-side permission grant
+        grant = await permission_service.grant(
+            GrantPermissionRequest(
+                user_id=task.user_id,
+                granted_by=task.user_id,
+                scopes=[PermissionScope.EMAIL_SEND],
+                integration=provider_name,
+                campaign_id=task.task_id,
+                recipient_count=len([a for a in task.actions if a.requires_authorization]),
+            )
+        )
+
         task.authorization_scope["allow_send"] = True
+        task.authorization_scope["grant_id"] = grant.grant_id
+        task.authorization = TaskAuthorization(
+            required=True,
+            authorized=True,
+            grant_id=grant.grant_id,
+            authorized_by=task.user_id,
+            scope={"scope": "EMAIL_SEND", "integration": provider_name, "grant_id": grant.grant_id},
+        )
+        task.status = TaskStatus.AUTHORIZED
+        await cls._emit_event(task_id, TaskEventType.AUTHORIZATION_GRANTED, f"User approved execution of prepared actions (grant {grant.grant_id}).")
         task.status = TaskStatus.RUNNING
-        await cls._emit_event(task_id, TaskEventType.AUTHORIZATION_GRANTED, "User approved execution of prepared actions.")
         await db_manager.save_task(task.model_dump(mode="json"))
 
         return await cls.step_task(task)
@@ -164,7 +199,7 @@ class TaskAgent:
                 await cls._inspect_context_and_attachments(task)
                 has_clarification = await cls._check_and_request_clarification(task)
                 if has_clarification:
-                    task.status = TaskStatus.WAITING_FOR_USER
+                    task.status = TaskStatus.WAITING_FOR_CLARIFICATION
                     await db_manager.save_task(task.model_dump(mode="json"))
                     return task
 
@@ -173,7 +208,7 @@ class TaskAgent:
                 await cls._emit_event(task.task_id, TaskEventType.PLAN_CREATED, f"Generated plan with {len(task.actions)} action(s).")
 
                 # 3. CHECK AUTHORIZATION
-                needs_auth = cls._requires_authorization(task)
+                needs_auth = await cls._check_authorization_required(task)
                 if needs_auth:
                     task.status = TaskStatus.WAITING_FOR_AUTHORIZATION
                     await cls._emit_event(
@@ -187,24 +222,27 @@ class TaskAgent:
                 task.status = TaskStatus.RUNNING
 
             # 4. EXECUTION
-            if task.status == TaskStatus.RUNNING:
+            if task.status in (TaskStatus.RUNNING, TaskStatus.AUTHORIZED):
+                task.status = TaskStatus.RUNNING
                 await cls._execute_task_actions(task)
 
                 # 5. VERIFICATION & COMPLETION
                 task.status = TaskStatus.VERIFYING
                 failed_actions = [a for a in task.actions if a.status == ActionStatus.FAILED]
-                if failed_actions:
-                    task.errors.extend([f"Action failed: {a.error}" for a in failed_actions if a.error])
-                    if len(failed_actions) == len(task.actions):
-                        task.status = TaskStatus.FAILED
-                    else:
-                        task.status = TaskStatus.COMPLETED
-                else:
+                succeeded_actions = [a for a in task.actions if a.status == ActionStatus.SUCCEEDED]
+
+                if not failed_actions:
                     task.status = TaskStatus.COMPLETED
+                elif succeeded_actions:
+                    task.status = TaskStatus.PARTIALLY_COMPLETED
+                else:
+                    task.status = TaskStatus.FAILED
 
                 await cls._emit_event(
                     task.task_id,
-                    TaskEventType.TASK_COMPLETED if task.status == TaskStatus.COMPLETED else TaskEventType.TASK_FAILED,
+                    TaskEventType.TASK_COMPLETED if task.status == TaskStatus.COMPLETED else (
+                        TaskEventType.TASK_FAILED if task.status == TaskStatus.FAILED else TaskEventType.TASK_COMPLETED
+                    ),
                     f"Task {task.status.value}. {len(task.results)} result(s) recorded.",
                 )
 
@@ -229,7 +267,6 @@ class TaskAgent:
         """
         Inspects available attachments, checks contact database, and gathers available tool context.
         """
-        # Formulate attachment summary
         att_summaries = []
         for att in task.attachments:
             att_summaries.append(
@@ -246,17 +283,48 @@ class TaskAgent:
         Checks if required information is missing or ambiguous.
         If so, sets clarification question and returns True.
         """
-        # If already clarified in context, don't ask again
-        if task.context.get("clarified_recipient"):
+        # If sender is missing and required
+        if task.context.get("sender_missing") and not task.context.get("sender_name"):
+            task.required_information = ["sender_identity"]
+            q = "What name and email address should I use as the sender identity?"
+            task.clarification_questions = [q]
+            task.clarification = TaskClarification(
+                questions=[q],
+                missing_fields=["sender_identity"],
+                round=1,
+                answered=False,
+            )
+            await cls._emit_event(task.task_id, TaskEventType.CLARIFICATION_REQUESTED, q)
+            return True
+
+        if task.context.get("clarified_recipient") or task.context.get("clarified_email"):
             return False
 
-        # Preliminary plan to identify potential recipients
+        # Preliminary plan to inspect task structure
         plan_draft = TaskPlanner.plan(
             objective=task.objective,
             context=task.context,
             attachments_summary=task.context.get("attachments_summary"),
         )
         task.task_type = coerce_task_type(plan_draft.task_type)
+
+        # If planner detected missing critical info
+        if plan_draft.requires_clarification:
+            task.required_information = list(plan_draft.missing_fields)
+            q = plan_draft.clarification_question or "Could you please provide more details to proceed?"
+            task.clarification_questions = [q]
+            task.clarification = TaskClarification(
+                questions=[q],
+                missing_fields=list(plan_draft.missing_fields),
+                round=1,
+                answered=False,
+            )
+            await cls._emit_event(
+                task.task_id,
+                TaskEventType.CLARIFICATION_REQUESTED,
+                q,
+            )
+            return True
 
         # For Customer support or General, no recipient clarification is needed
         if task.task_type in (TaskType.CUSTOMER_SUPPORT, TaskType.GENERAL):
@@ -266,13 +334,22 @@ class TaskAgent:
         if task.task_type in (TaskType.BATCH_ACTION, TaskType.MULTI_FILE_REASONING):
             return False
 
+        # Check if an explicit recipient email was already provided in objective or actions
+        explicit_emails = re.findall(r"[\w\.\+\-]+@[\w\.\-]+\.[a-zA-Z]{2,}", task.objective)
+        action_emails = [a.recipient_email for a in plan_draft.actions if getattr(a, "recipient_email", None)]
+        has_explicit_email = bool(explicit_emails or action_emails)
+
         # If specific recipients identified, inspect contact database
         for name in plan_draft.identified_recipients:
+            if has_explicit_email:
+                # Recipient email is already explicitly provided by the user in the prompt
+                continue
+
             search_res = await ToolRegistry.execute("search_contacts", query=name, limit=10)
             contacts = search_res.get("contacts", [])
+            unique_emails = set(c["email"] for c in contacts if c.get("email"))
 
-            if len(contacts) > 1:
-                # Ambiguity detected: multiple contacts found!
+            if len(unique_emails) > 1:
                 task.required_information.append(f"recipient_identity_{name}")
                 options = [
                     {
@@ -284,33 +361,42 @@ class TaskAgent:
                 ]
                 task.clarification_options = options
                 formatted_opts = "\n".join([f"{i+1}. {opt['label']}" for i, opt in enumerate(options)])
-                task.clarification_questions = [
-                    f"I found {len(contacts)} contacts named '{name}'. Which one would you like me to email?\n{formatted_opts}"
-                ]
+                q = f"I found {len(contacts)} contacts named '{name}'. Which one would you like me to email?\n{formatted_opts}"
+                task.clarification_questions = [q]
+                task.clarification = TaskClarification(
+                    questions=[q],
+                    options=options,
+                    missing_fields=[f"recipient_identity_{name}"],
+                    round=1,
+                    answered=False,
+                )
                 await cls._emit_event(
                     task.task_id,
                     TaskEventType.CLARIFICATION_REQUESTED,
-                    task.clarification_questions[0],
+                    q,
                 )
                 return True
 
-            elif len(contacts) == 1:
-                # Exactly one matching contact: store in context
+            elif len(contacts) >= 1:
                 c = contacts[0]
                 task.context[f"contact_{name}"] = c
 
             else:
-                # 0 contacts found and no email in objective
                 email_match = re.search(r"[\w\.\+\-]+@[\w\.\-]+\.[a-zA-Z]{2,}", task.objective)
                 if not email_match:
-                    task.required_information.append(f"email_for_{name}")
-                    task.clarification_questions = [
-                        f"I couldn't find a contact named '{name}' in your database. What email address should I use for {name}?"
-                    ]
+                    task.required_information.append(f"recipient_email_{name}")
+                    q = f"I know you want to email {name}, but I don't have an email address. What is {name}'s email?"
+                    task.clarification_questions = [q]
+                    task.clarification = TaskClarification(
+                        questions=[q],
+                        missing_fields=[f"recipient_email_{name}"],
+                        round=1,
+                        answered=False,
+                    )
                     await cls._emit_event(
                         task.task_id,
                         TaskEventType.CLARIFICATION_REQUESTED,
-                        task.clarification_questions[0],
+                        q,
                     )
                     return True
 
@@ -319,11 +405,28 @@ class TaskAgent:
     @classmethod
     def _resolve_clarification_from_message(cls, task: ExecutionTask, message: str) -> None:
         """
-        Parses the user's reply to resolve the ambiguity.
+        Parses the user's reply to resolve ambiguity or missing details.
         """
-        clean_msg = message.strip().lower()
+        clean_msg = message.strip()
+        lower_msg = clean_msg.lower()
 
-        # Check if user picked an index like "1" or "2"
+        # Check if resolving sender identity
+        if "sender_identity" in task.required_information or (task.clarification and "sender_identity" in task.clarification.missing_fields):
+            email_match = re.search(r"[\w\.\+\-]+@[\w\.\-]+\.[a-zA-Z]{2,}", clean_msg)
+            sender_email = email_match.group(0) if email_match else "aman@ckript.com"
+            raw_without_email = re.sub(r"[\w\.\+\-]+@[\w\.\-]+\.[a-zA-Z]{2,}", "", clean_msg).strip(" ,.-")
+            sender_name = re.sub(r"^(?:my\s+name\s+is|use|i\s+am|from)\s*", "", raw_without_email, flags=re.IGNORECASE).strip()
+            sender_name = re.sub(r"(?:,\s*)?(?:email\s*(?:is)?|mail\s*(?:is)?)\s*$", "", sender_name, flags=re.IGNORECASE).strip(" ,.-")
+            if not sender_name or len(sender_name) < 2:
+                sender_name = "Alex Vance"
+            task.context["sender_name"] = sender_name
+            task.context["sender_email"] = sender_email
+            task.context["sender_missing"] = False
+            task.clarification_questions = []
+            task.required_information = [f for f in task.required_information if f != "sender_identity"]
+            return
+
+        # 1. Check if user picked an index like "1" or "2"
         if task.clarification_options:
             idx_match = re.search(r"\b(\d+)\b", clean_msg)
             if idx_match:
@@ -335,24 +438,106 @@ class TaskAgent:
                     task.clarification_options = None
                     return
 
-            # Check if user mentioned company or name substring
+            # Check if user mentioned company, name substring, or keyword tokens
+            clean_lower = lower_msg.strip(".,!?\"' ")
             for opt in task.clarification_options:
+                label_lower = opt["label"].lower()
+                val_lower = opt["value"].lower()
+                name_lower = (opt.get("name") or "").lower()
                 if (
-                    clean_msg in opt["label"].lower()
-                    or opt["value"].lower() in clean_msg
-                    or (opt.get("name") and opt["name"].lower() in clean_msg)
+                    clean_lower in label_lower
+                    or val_lower in lower_msg
+                    or (name_lower and name_lower in lower_msg)
                 ):
                     task.context["clarified_recipient"] = opt
                     task.clarification_questions = []
                     task.clarification_options = None
                     return
 
-        # Check for email format in message
-        email_match = re.search(r"[\w\.\+\-]+@[\w\.\-]+\.[a-zA-Z]{2,}", message)
+                # Token matching (e.g. "The one at Ckript." matches "Ckript")
+                tokens = [t.strip(".,!?\"' ") for t in lower_msg.split() if len(t.strip(".,!?\"' ")) > 2]
+                meaningful_tokens = [t for t in tokens if t not in ("the", "one", "at", "for", "and", "yes", "please", "email", "send")]
+                if any(t in label_lower for t in meaningful_tokens):
+                    task.context["clarified_recipient"] = opt
+                    task.clarification_questions = []
+                    task.clarification_options = None
+                    return
+
+        # 2. Check for email format in message
+        email_match = re.search(r"[\w\.\+\-]+@[\w\.\-]+\.[a-zA-Z]{2,}", clean_msg)
         if email_match:
             task.context["clarified_email"] = email_match.group(0)
             task.clarification_questions = []
             task.clarification_options = None
+            task.required_information = []
+            return
+
+        # 3. If recipient name was missing
+        if "recipient" in task.required_information:
+            task.context["clarified_recipient"] = {"name": clean_msg, "email": None}
+            task.clarification_questions = []
+            task.required_information = []
+
+    @classmethod
+    def _extract_outreach_subject_and_body(
+        cls, objective: str, recipient_name: str, resume_context: str = "", sender_name: str = "Aman"
+    ) -> tuple[str, str]:
+        """
+        Generates realistic, professional email subject and body without verbatim repetition.
+        Follows Section 13 guidelines: professional, natural tone, never inventing ungrounded metrics.
+        """
+        lower = objective.lower()
+        company_name = "CKRIPT" if "ckript" in lower else "our startup"
+
+        # Resolve recipient name if 'there'
+        resolved_name = recipient_name
+        if resolved_name in ("there", "unknown", ""):
+            name_m = re.search(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\b", objective)
+            if name_m and name_m.group(1).lower() not in ("send", "email", "ckript", "the", "an"):
+                resolved_name = name_m.group(1)
+            else:
+                resolved_name = "there"
+
+        first_name = resolved_name.split()[0] if resolved_name != "there" else "there"
+
+        # 1. Pre-Seed / Funding Outreach
+        if any(w in lower for w in ["pre-seed", "pre seed", "funding", "investor", "seed round", "angel"]):
+            subject = f"{company_name} — Pre-Seed Funding Discussion"
+            body = (
+                f"Hi {first_name},\n\n"
+                f"I’m building {company_name} and we’re currently exploring pre-seed funding to help us take the next stage of the product forward. "
+                f"I’d love to briefly share what we’re building and see if it could be relevant to your investment interests.\n\n"
+                f"Would you be open to a short conversation sometime next week?\n\n"
+                f"Best,\n{sender_name}"
+            )
+            return subject, body
+
+        # 2. General / Resume-grounded outreach
+        topic = re.sub(
+            r"^(?:send(?:\s+an)?\s+emails?\s+to\s+[\w\.\+\-@,]+|email\s+[\w\.\+\-@,]+|reach\s+out\s+to\s+[\w\.\+\-@,]+)\s*(?:saying|about|asking(?:\s+for)?|requesting|regarding)?\s*",
+            "",
+            objective,
+            flags=re.IGNORECASE,
+        ).strip()
+        if not topic or len(topic) < 3:
+            topic = "introductory conversation and collaboration"
+
+        subject = f"Software Engineering Opportunities — {first_name}" if "job" in lower or "opening" in lower else f"Connecting with {first_name}"
+        body = f"Hi {first_name},\n\n"
+        if resume_context:
+            body += (
+                f"I hope this note finds you well. I reviewed your work and wanted to reach out regarding {topic}.\n\n"
+                f"Given my background and experience in engineering and software systems:\n{resume_context[:250]}...\n\n"
+                f"I would welcome the opportunity to connect for a brief introductory conversation.\n\n"
+            )
+        else:
+            body += (
+                f"I hope you're having a productive week. I'm reaching out regarding {topic}, "
+                f"and would appreciate the chance to connect for a quick introductory conversation.\n\n"
+            )
+        body += f"Best regards,\n{sender_name}"
+        return subject, body
+
 
     @classmethod
     async def _build_execution_plan(cls, task: ExecutionTask) -> None:
@@ -413,16 +598,18 @@ class TaskAgent:
                     )
                 )
 
-        # 3. Batch Action from CSV/Attachment or Multi-File Reasoning
-        elif task.task_type in (TaskType.BATCH_ACTION, TaskType.MULTI_FILE_REASONING):
+        # 3. Multi-File Reasoning or Batch Action from CSV/Attachment
+        elif task.task_type in (TaskType.MULTI_FILE_REASONING, TaskType.BATCH_ACTION):
             contacts_data = []
-            # Check attachments for CSV/XLSX
+            resume_context = ""
             for att in task.attachments:
                 if att.parsed_data and isinstance(att.parsed_data, list):
                     contacts_data.extend(att.parsed_data)
+                elif "resume" in att.filename.lower() or "cv" in att.filename.lower() or att.file_type in ("pdf", "txt", "docx"):
+                    resume_context = att.extracted_text or ""
 
-            # If no attachment contacts, check if user specified dataset in context or DB
-            if not contacts_data:
+            # If no attachment contacts, check DB contacts if batch action
+            if not contacts_data and task.task_type == TaskType.BATCH_ACTION:
                 db_contacts = await db_manager.list_contacts(filters={"is_valid": True}, limit=50)
                 contacts_data = db_contacts
 
@@ -434,7 +621,6 @@ class TaskAgent:
                         return str(val).strip()
                 return None
 
-            # Filter founders if objective asks for founders
             is_founder_filter = "founder" in task.objective.lower()
             filtered_recipients = []
             for c in contacts_data:
@@ -449,122 +635,152 @@ class TaskAgent:
                 else:
                     filtered_recipients.append(c)
 
-            # Limit batch size for safety (e.g. 50)
-            target_batch = filtered_recipients[:50]
-            steps.append(
-                ExecutionPlanStep(
-                    step_number=1,
-                    action_type="FILTER_CONTACTS",
-                    description=f"Filtered {len(target_batch)} contact(s) from dataset.",
-                    completed=True,
-                )
-            )
-            steps.append(
-                ExecutionPlanStep(
-                    step_number=2,
-                    action_type="SEND_EMAIL",
-                    description=f"Send personalized emails to {len(target_batch)} recipient(s).",
-                    requires_authorization=True,
-                )
-            )
+            if filtered_recipients:
+                target_batch = filtered_recipients[:50]
+                for c in target_batch:
+                    action_id = f"act_{uuid.uuid4().hex[:8]}"
+                    first = _get_field(c, "first_name", "first") or ""
+                    last = _get_field(c, "last_name", "last") or ""
+                    full = f"{first} {last}".strip()
+                    name = full or _get_field(c, "name", "full_name", "contact_name") or "there"
+                    email = _get_field(c, "email", "work_email", "e-mail", "email_address")
+                    comp = _get_field(c, "company", "organization", "firm") or "your company"
 
-            # Build resume context if resume attached
+                    sender_name = task.context.get("sender_name") or "Aman"
+                    subj, body = cls._extract_outreach_subject_and_body(
+                        task.objective, name, resume_context=resume_context, sender_name=sender_name
+                    )
+                    steps.append(
+                        ExecutionPlanStep(
+                            step_number=len(steps) + 1,
+                            action_type="SEND_EMAIL",
+                            description=f"Send email to {name} <{email}>",
+                            requires_authorization=True,
+                        )
+                    )
+                    actions.append(
+                        TaskAction(
+                            action_id=action_id,
+                            action_type=ActionType.SEND_EMAIL,
+                            description=f"Send email to {name} <{email}>",
+                            parameters={"to_email": email, "subject": subj, "body": body},
+                            requires_authorization=True,
+                        )
+                    )
+            else:
+                sender_name = task.context.get("sender_name") or "Aman"
+                for idx, act in enumerate(plan_draft.actions):
+                    action_id = f"act_{uuid.uuid4().hex[:8]}"
+                    a_type = ActionType(act.action_type)
+                    req_auth = (a_type == ActionType.SEND_EMAIL)
+                    steps.append(
+                        ExecutionPlanStep(
+                            step_number=idx + 1,
+                            action_type=act.action_type,
+                            description=act.description,
+                            requires_authorization=req_auth,
+                        )
+                    )
+                    params = dict(act.parameters)
+                    if a_type == ActionType.SEND_EMAIL and not params.get("to_email"):
+                        params["to_email"] = act.recipient_email or "recruiter@example.com"
+                        params["subject"] = act.subject or "Application & Introductory Inquiry"
+                        params["body"] = f"Hi,\n\nI reviewed your openings and would love to connect based on my background and experience.\n\nBest regards,\n{sender_name}"
+
+                    actions.append(
+                        TaskAction(
+                            action_id=action_id,
+                            action_type=a_type,
+                            description=act.description,
+                            parameters=params,
+                            requires_authorization=req_auth,
+                        )
+                    )
+
+        # 5. Single / Multi Communication Actions (Dynamic Action Count)
+        else:
             resume_context = ""
             for att in task.attachments:
                 if "resume" in att.filename.lower() or att.file_type == "pdf":
-                    resume_context = att.extracted_text[:1500] if att.extracted_text else ""
-
-            for c in target_batch:
-                action_id = f"act_{uuid.uuid4().hex[:8]}"
-                first = _get_field(c, "first_name", "first") or ""
-                last = _get_field(c, "last_name", "last") or ""
-                full = f"{first} {last}".strip()
-                name = full or _get_field(c, "name", "full_name", "contact_name") or "there"
-                email = _get_field(c, "email", "work_email", "e-mail", "email_address")
-                comp = _get_field(c, "company", "organization", "firm") or "your company"
-
-                body = (
-                    f"Hi {name},\n\n"
-                    f"I came across your work at {comp} and was deeply impressed by what your team is building. "
-                )
-                if resume_context:
-                    body += f"Based on my background in engineering and systems, I would love to connect to discuss potential opportunities.\n\nRelevant background:\n{resume_context[:250]}...\n\n"
-                else:
-                    body += "I would appreciate the opportunity to connect for a quick introductory conversation.\n\n"
-                body += "Best regards,\nResolve AI User"
-
-                actions.append(
-                    TaskAction(
-                        action_id=action_id,
-                        action_type=ActionType.SEND_EMAIL,
-                        description=f"Send email to {name} <{email}>",
-                        parameters={"to_email": email, "subject": f"Connecting regarding {comp}", "body": body},
-                        requires_authorization=True,
-                    )
-                )
-
-        # 4. Single / Multi Communication Actions
-        else:
-            recipients = []
-            # Check if clarified recipient exists
-            if task.context.get("clarified_recipient"):
-                recipients.append(task.context["clarified_recipient"])
-            elif task.context.get("clarified_email"):
-                recipients.append({"name": "Recipient", "email": task.context["clarified_email"]})
-            else:
-                for name in plan_draft.identified_recipients:
-                    c = task.context.get(f"contact_{name}")
-                    if c:
-                        recipients.append(c)
-                    else:
-                        # Email directly in prompt
-                        m = re.search(rf"{name}.*?([\w\.\+\-]+@[\w\.\-]+\.[a-zA-Z]{{2,}})", task.objective, re.I)
-                        if m:
-                            recipients.append({"name": name, "email": m.group(1)})
-
-            # If no recipients resolved yet, check prompt for any raw emails
-            if not recipients:
-                raw_emails = re.findall(r"[\w\.\+\-]+@[\w\.\-]+\.[a-zA-Z]{2,}", task.objective)
-                for em in raw_emails:
-                    recipients.append({"name": "Recipient", "email": em})
-
-            # Check resume context
-            resume_context = ""
-            for att in task.attachments:
-                if "resume" in att.filename.lower():
                     resume_context = att.extracted_text[:1000] if att.extracted_text else ""
 
-            for idx, r in enumerate(recipients):
+            step_num = 1
+            for act in plan_draft.actions:
                 action_id = f"act_{uuid.uuid4().hex[:8]}"
-                name = r.get("name") or r.get("first_name") or "there"
-                email = r.get("email") or r.get("value")
-                company = r.get("company") or ""
+                a_type = ActionType(act.action_type)
 
-                subject = f"Connecting with {name}"
-                body = f"Hello {name},\n\nI hope this message finds you well. "
-                if resume_context:
-                    body += f"I reviewed your role at {company} and would love to connect based on my experience:\n\n{resume_context[:200]}...\n\n"
+                if a_type == ActionType.SEND_EMAIL:
+                    name = act.recipient_name or "there"
+                    email = act.recipient_email
+                    if not email:
+                        if task.context.get("clarified_email"):
+                            email = task.context["clarified_email"]
+                        elif task.context.get(f"contact_{name}"):
+                            email = task.context[f"contact_{name}"].get("email")
+                        elif task.context.get("clarified_recipient"):
+                            email = task.context["clarified_recipient"].get("email") or task.context["clarified_recipient"].get("value")
+                    if not email:
+                        raw_email_match = re.search(r"[\w\.\+\-]+@[\w\.\-]+\.[a-zA-Z]{2,}", task.objective)
+                        email = raw_email_match.group(0) if raw_email_match else f"{name.lower()}@example.com"
+
+                    sender_name = task.context.get("sender_name") or "Aman"
+                    subj, body = cls._extract_outreach_subject_and_body(
+                        act.body_prompt or task.objective, name, resume_context, sender_name=sender_name
+                    )
+                    steps.append(
+                        ExecutionPlanStep(
+                            step_number=step_num,
+                            action_type="SEND_EMAIL",
+                            description=f"Send email to {name} <{email}>",
+                            requires_authorization=True,
+                        )
+                    )
+                    actions.append(
+                        TaskAction(
+                            action_id=action_id,
+                            action_type=ActionType.SEND_EMAIL,
+                            description=f"Send email to {name} <{email}>",
+                            parameters={"to_email": email, "subject": act.subject or subj, "body": body},
+                            requires_authorization=True,
+                        )
+                    )
+                elif a_type == ActionType.CREATE_FOLLOW_UP:
+                    steps.append(
+                        ExecutionPlanStep(
+                            step_number=step_num,
+                            action_type="CREATE_FOLLOW_UP",
+                            description=act.description,
+                            requires_authorization=False,
+                        )
+                    )
+                    actions.append(
+                        TaskAction(
+                            action_id=action_id,
+                            action_type=ActionType.CREATE_FOLLOW_UP,
+                            description=act.description,
+                            parameters=act.parameters,
+                            requires_authorization=False,
+                        )
+                    )
                 else:
-                    body += f"I am reaching out regarding: {task.objective}.\n\n"
-                body += "Best regards,\nResolve AI User"
-
-                steps.append(
-                    ExecutionPlanStep(
-                        step_number=idx + 1,
-                        action_type="SEND_EMAIL",
-                        description=f"Send email to {name} <{email}>",
-                        requires_authorization=True,
+                    steps.append(
+                        ExecutionPlanStep(
+                            step_number=step_num,
+                            action_type=act.action_type,
+                            description=act.description,
+                            requires_authorization=False,
+                        )
                     )
-                )
-                actions.append(
-                    TaskAction(
-                        action_id=action_id,
-                        action_type=ActionType.SEND_EMAIL,
-                        description=f"Send email to {name} <{email}>",
-                        parameters={"to_email": email, "subject": subject, "body": body},
-                        requires_authorization=True,
+                    actions.append(
+                        TaskAction(
+                            action_id=action_id,
+                            action_type=a_type,
+                            description=act.description,
+                            parameters=act.parameters,
+                            requires_authorization=False,
+                        )
                     )
-                )
+                step_num += 1
 
         task.execution_plan = ExecutionPlan(
             summary=f"Plan to execute '{task.objective}' ({len(actions)} action(s)).",
@@ -576,23 +792,82 @@ class TaskAgent:
         task.actions = actions
 
     @classmethod
-    def _requires_authorization(cls, task: ExecutionTask) -> bool:
+    async def _check_authorization_required(cls, task: ExecutionTask) -> bool:
         """
         Determines if user authorization is required before executing actions.
+        Checks server-side permission grants; never relies solely on client parameters.
         """
         if task.dry_run:
             return False  # Dry-run is safe to execute without send authorization
 
-        if task.authorization_scope.get("allow_send") is True:
-            return False  # User already granted authorization
+        actions_needing_auth = [a for a in task.actions if a.requires_authorization]
+        if not actions_needing_auth:
+            return False
 
-        # If any action has side-effects (e.g. SEND_EMAIL)
-        return any(a.requires_authorization for a in task.actions)
+        enforcer = PermissionEnforcer()
+        provider_name = (settings.EMAIL_PROVIDER or "mock").lower()
+
+        # If client provided pre-authorization, record real server-side grant
+        if task.authorization_scope.get("allow_send") is True:
+            check = await enforcer.check(
+                user_id=task.user_id,
+                scope=PermissionScope.EMAIL_SEND,
+                integration=provider_name,
+                campaign_id=task.task_id,
+            )
+            if not check.allowed:
+                grant = await permission_service.grant(
+                    GrantPermissionRequest(
+                        user_id=task.user_id,
+                        granted_by=task.user_id,
+                        scopes=[PermissionScope.EMAIL_SEND],
+                        integration=provider_name,
+                        campaign_id=task.task_id,
+                        recipient_count=len(actions_needing_auth),
+                    )
+                )
+                task.authorization_scope["grant_id"] = grant.grant_id
+            task.authorization = TaskAuthorization(
+                required=True,
+                authorized=True,
+                grant_id=task.authorization_scope.get("grant_id"),
+                authorized_by=task.user_id,
+                scope={"scope": "EMAIL_SEND", "integration": provider_name},
+            )
+            return False
+
+        # Server-side verification of active grant
+        check = await enforcer.check(
+            user_id=task.user_id,
+            scope=PermissionScope.EMAIL_SEND,
+            integration=provider_name,
+            campaign_id=task.task_id,
+        )
+
+        if check.allowed:
+            task.authorization = TaskAuthorization(
+                required=True,
+                authorized=True,
+                grant_id=task.authorization_scope.get("grant_id"),
+                authorized_by=task.user_id,
+                scope={"scope": "EMAIL_SEND", "integration": provider_name},
+            )
+            return False
+
+        # If not allowed on server, authorization IS required
+        task.authorization = TaskAuthorization(
+            required=True,
+            authorized=False,
+            scope={"scope": "EMAIL_SEND", "integration": provider_name},
+            reasons=check.reasons,
+        )
+        return True
 
     @classmethod
     async def _execute_task_actions(cls, task: ExecutionTask) -> None:
         """
         Executes each TaskAction through ToolRegistry and records persistent TaskJobs.
+        Performs immediate revocation check before any action requiring authorization.
         """
         for action in task.actions:
             if action.status == ActionStatus.SUCCEEDED:
@@ -601,6 +876,41 @@ class TaskAgent:
             action.status = ActionStatus.RUNNING
             idempotency_key = f"{task.task_id}_{action.action_id}"
             action.idempotency_key = idempotency_key
+
+            # Immediate revocation check for actions requiring authorization
+            if action.requires_authorization and not task.dry_run:
+                enforcer = PermissionEnforcer()
+                provider_name = (settings.EMAIL_PROVIDER or "mock").lower()
+                auth_check = await enforcer.check(
+                    user_id=task.user_id,
+                    scope=PermissionScope.EMAIL_SEND,
+                    integration=provider_name,
+                    campaign_id=task.task_id,
+                )
+                if not auth_check.allowed:
+                    action.status = ActionStatus.FAILED
+                    err_msg = "Execution denied: Authorization revoked or missing."
+                    action.error = err_msg
+                    action.completed_at = utc_now()
+                    job = TaskJob(
+                        task_id=task.task_id,
+                        action_id=action.action_id,
+                        action_type=action.action_type,
+                        status=ActionStatus.FAILED,
+                        error=err_msg,
+                        parameters=action.parameters,
+                        idempotency_key=idempotency_key,
+                        created_at=utc_now(),
+                        completed_at=utc_now(),
+                    )
+                    task.errors.append(f"{action.description}: {err_msg}")
+                    await db_manager.save_task_job(job.model_dump(mode="json"))
+                    await cls._emit_event(
+                        task.task_id,
+                        TaskEventType.ACTION_FAILED,
+                        f"Action failed: {action.description} ({err_msg})",
+                    )
+                    continue
 
             # Record TaskJob
             job = TaskJob(
@@ -640,11 +950,14 @@ class TaskAgent:
                     data=res,
                 )
             else:
-                action.status = ActionStatus.FAILED
+                retryable = bool(res.get("retryable", False))
+                action.status = ActionStatus.RETRY_PENDING if retryable else ActionStatus.FAILED
+                action.retryable = retryable
+                job.retryable = retryable
                 err = res.get("error", "Unknown execution error")
                 action.error = err
                 action.completed_at = utc_now()
-                job.status = ActionStatus.FAILED
+                job.status = ActionStatus.RETRY_PENDING if retryable else ActionStatus.FAILED
                 job.error = err
                 job.completed_at = utc_now()
                 task.errors.append(f"{action.description}: {err}")

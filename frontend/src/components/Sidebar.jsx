@@ -34,7 +34,7 @@ export default function Sidebar({
         {onOpenWorkspace ? (
           <button className="btn-workspace-switch" onClick={onOpenWorkspace}>
             <LayoutDashboard size={15} />
-            <span>Automation workspace</span>
+            <span>Autonomous Agent Workspace</span>
           </button>
         ) : null}
       </div>

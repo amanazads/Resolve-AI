@@ -48,25 +48,34 @@ _SEND_HTTP_STATUS = {
 }
 
 
-@router.post("/connect", response_model=GmailAuthorizationResponse)
-async def connect_gmail(payload: Optional[GmailConnectRequest] = None):
+@router.api_route("/connect", methods=["GET", "POST"], response_model=GmailAuthorizationResponse)
+async def connect_gmail(
+    payload: Optional[GmailConnectRequest] = None,
+    account_id: Optional[str] = Query(default=None),
+    login_hint: Optional[str] = Query(default=None),
+    redirect_after: Optional[str] = Query(default=None),
+):
     """
-    Starts the OAuth 2.0 authorization-code flow.
+    Starts the OAuth 2.0 authorization-code flow via GET or POST.
 
     Returns the Google consent URL for the frontend to redirect to. It does not
     itself contact Google and it issues no credentials.
     """
-    body = payload or GmailConnectRequest()
+    body_account_id = payload.account_id if payload and payload.account_id else account_id
+    body_login_hint = (str(payload.login_hint) if payload and payload.login_hint else None) or login_hint
+    body_redirect = payload.redirect_after if payload and payload.redirect_after else redirect_after
+
     try:
         return gmail_service.start_authorization(
-            account_id=body.account_id,
-            login_hint=str(body.login_hint) if body.login_hint else None,
-            redirect_after=body.redirect_after,
+            account_id=body_account_id,
+            login_hint=body_login_hint,
+            redirect_after=body_redirect,
         )
     except GmailNotConfiguredError as exc:
         raise HTTPException(status_code=503, detail=exc.message) from exc
     except GmailAuthError as exc:
         raise HTTPException(status_code=400, detail=exc.message) from exc
+
 
 
 @router.get("/callback")

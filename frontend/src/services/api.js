@@ -24,11 +24,47 @@ const client = axios.create({
 });
 
 /*
- * The backend has no authentication yet, so the principal is a constant here.
- * When auth lands this is the single place that changes: every permission-aware
- * call already sends `user_id` from this value rather than hardcoding one.
+ * User Identity Context Abstraction.
+ * Derives current operator identity from local storage or defaults to 'local_user'.
+ * Injected automatically into all API requests via X-User-ID headers.
  */
-export const CURRENT_USER = 'user123';
+let currentUserId = (typeof window !== 'undefined' && localStorage.getItem('resolve_user_id')) || 'local_user';
+let currentUserEmail = (typeof window !== 'undefined' && localStorage.getItem('resolve_user_email')) || 'aman@ckript.com';
+let currentUserName = (typeof window !== 'undefined' && localStorage.getItem('resolve_user_name')) || 'Aman Azad';
+
+export function getCurrentUser() {
+  return {
+    user_id: currentUserId,
+    email: currentUserEmail,
+    name: currentUserName
+  };
+}
+
+export function setCurrentUser({ user_id, email, name }) {
+  if (user_id) {
+    currentUserId = user_id;
+    if (typeof window !== 'undefined') localStorage.setItem('resolve_user_id', user_id);
+  }
+  if (email !== undefined) {
+    currentUserEmail = email;
+    if (typeof window !== 'undefined') localStorage.setItem('resolve_user_email', email);
+  }
+  if (name !== undefined) {
+    currentUserName = name;
+    if (typeof window !== 'undefined') localStorage.setItem('resolve_user_name', name);
+  }
+}
+
+export const CURRENT_USER = currentUserId;
+
+client.interceptors.request.use((config) => {
+  config.headers = config.headers || {};
+  config.headers['X-User-ID'] = currentUserId;
+  config.headers['X-User-Email'] = currentUserEmail;
+  config.headers['X-User-Name'] = currentUserName;
+  return config;
+});
+
 
 /**
  * Normalises an Axios failure into something a screen can render.
@@ -251,8 +287,12 @@ export const listAutomationRuns = async (limit = 25) =>
  * or client secret is ever part of a response, and none is stored client-side.
  * ========================================================================== */
 
+export const listIntegrations = async () =>
+  unwrap(client.get('/integrations'));
+
 export const getGmailStatus = async (accountId) =>
   unwrap(client.get('/integrations/gmail/status', { params: accountId ? { account_id: accountId } : {} }));
+
 
 export const connectGmail = async ({ accountId, loginHint, redirectAfter } = {}) =>
   unwrap(

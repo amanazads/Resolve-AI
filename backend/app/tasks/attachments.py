@@ -6,20 +6,28 @@ and concise text contexts for agent multi-file reasoning.
 """
 
 import csv
+import hashlib
 import io
 import json
 import logging
+import mimetypes
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from app.tasks.models import TaskAttachment
+from app.config import settings
+from app.tasks.models import TaskArtifact
 
 logger = logging.getLogger(__name__)
+
+DANGEROUS_EXTENSIONS = {
+    ".exe", ".bat", ".cmd", ".sh", ".bash", ".bin", ".msi", ".dll", ".so", ".dmg",
+    ".app", ".vbs", ".ps1", ".jar", ".scr", ".pif", ".cpl", ".iso"
+}
 
 
 class AttachmentProcessor:
     """
-    Ingests and extracts text/data from diverse file formats.
+    Ingests, validates, and extracts text/data from diverse file formats with security controls.
     """
 
     @classmethod
@@ -28,12 +36,27 @@ class AttachmentProcessor:
         content: bytes,
         filename: str,
         metadata: Optional[Dict[str, Any]] = None,
-    ) -> TaskAttachment:
+        task_id: Optional[str] = None,
+    ) -> TaskArtifact:
         """
-        Parses raw bytes into a populated TaskAttachment.
+        Parses raw bytes into a populated, secure TaskArtifact.
         """
-        lower_name = filename.lower()
         size_bytes = len(content)
+        max_bytes = getattr(settings, "MAX_FILE_SIZE_BYTES", 25 * 1024 * 1024)
+        if size_bytes > max_bytes:
+            raise ValueError(
+                f"File '{filename}' ({size_bytes} bytes) exceeds maximum permitted size of {max_bytes} bytes."
+            )
+
+        suffix = Path(filename).suffix.lower()
+        if suffix in DANGEROUS_EXTENSIONS:
+            raise ValueError(f"File '{filename}' has dangerous or executable extension '{suffix}' and is rejected.")
+
+        sha256_hash = hashlib.sha256(content).hexdigest()
+        guessed_mime, _ = mimetypes.guess_type(filename)
+        mime_type = guessed_mime or "application/octet-stream"
+
+        lower_name = filename.lower()
         meta = dict(metadata or {})
         extracted_text = ""
         parsed_data = None
@@ -42,41 +65,52 @@ class AttachmentProcessor:
         try:
             if lower_name.endswith(".csv"):
                 file_type = "csv"
+                mime_type = mime_type or "text/csv"
                 extracted_text, parsed_data = cls._parse_csv(content)
             elif lower_name.endswith((".xlsx", ".xlsm")):
                 file_type = "xlsx"
+                mime_type = mime_type or "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 extracted_text, parsed_data = cls._parse_xlsx(content)
             elif lower_name.endswith(".pdf"):
                 file_type = "pdf"
+                mime_type = mime_type or "application/pdf"
                 extracted_text = cls._parse_pdf(content)
             elif lower_name.endswith((".docx", ".doc")):
                 file_type = "docx"
+                mime_type = mime_type or "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
                 extracted_text = cls._parse_docx(content)
             elif lower_name.endswith(".json"):
                 file_type = "json"
+                mime_type = mime_type or "application/json"
                 extracted_text, parsed_data = cls._parse_json(content)
             else:
                 file_type = "text"
+                mime_type = mime_type or "text/plain"
                 extracted_text = cls._parse_text(content)
 
         except Exception as e:
             logger.warning("Error processing attachment '%s': %s", filename, e)
             extracted_text = f"[Error reading file content: {e}]"
 
-        # Build clean summary
+        # Build clean summary preview
         summary = (
             extracted_text[:2000] + ("..." if len(extracted_text) > 2000 else "")
             if extracted_text
             else ""
         )
         meta["preview"] = summary
+        meta["sha256"] = sha256_hash
 
-        return TaskAttachment(
+        return TaskArtifact(
             filename=filename,
             file_type=file_type,
+            mime_type=mime_type,
             size_bytes=size_bytes,
+            sha256_hash=sha256_hash,
             extracted_text=extracted_text,
+            structured_data=parsed_data,
             parsed_data=parsed_data,
+            task_id=task_id,
             metadata=meta,
         )
 

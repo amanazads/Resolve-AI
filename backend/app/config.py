@@ -1,18 +1,39 @@
 import os
 from pathlib import Path
-from pydantic_settings import BaseSettings
+from typing import List, Union
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Root directory of the project
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 
 class Settings(BaseSettings):
-    PROJECT_NAME: str = "AI Customer Support System"
+    model_config = SettingsConfigDict(
+        env_file=str(BASE_DIR / ".env"),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    PROJECT_NAME: str = "Resolve AI"
     VERSION: str = "1.0.0"
     API_PREFIX: str = "/api"
     
+    # CORS & Security
+    ALLOWED_ORIGINS: List[str] = [
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1:5173",
+    ]
+    
+    # File Context Intelligence
+    MAX_FILE_SIZE_BYTES: int = 25 * 1024 * 1024  # 25 MB max file upload
+    ALLOWED_FILE_EXTENSIONS: List[str] = [
+        ".csv", ".xlsx", ".xlsm", ".pdf", ".docx", ".doc", ".txt", ".json", ".md"
+    ]
+    
     # Gemini API
     GEMINI_API_KEY: str = ""
-    LLM_MODEL: str = "gemini-1.5-flash"
+    LLM_MODEL: str = "gemini-2.5-flash-lite"
     
     # Databases
     MONGODB_URI: str = "mongodb://localhost:27017"
@@ -55,11 +76,6 @@ class Settings(BaseSettings):
     # Lifetime of a pending OAuth `state` value.
     GMAIL_OAUTH_STATE_TTL_SECONDS: int = 600
     GMAIL_HTTP_TIMEOUT_SECONDS: float = 20.0
-
-    class Config:
-        env_file = str(BASE_DIR / ".env")
-        env_file_encoding = "utf-8"
-        extra = "ignore"
 
 settings = Settings()
 if settings.HF_TOKEN:

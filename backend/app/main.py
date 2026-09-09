@@ -18,6 +18,7 @@ from app.database.mongodb import db_manager
 from app.api.routes import chat, health, automation, contacts
 from app.campaigns import router as campaigns_router
 from app.tasks import tasks_router
+from app.integrations.routes import router as integrations_router
 from app.integrations.gmail.routes import router as gmail_router
 from app.permissions.routes import router as permissions_router
 from app.automation.campaign_service import campaign_service
@@ -59,10 +60,10 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# Enable CORS for frontend integration
+# Enable secure CORS with configured allowed origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -75,6 +76,7 @@ app.include_router(automation.router, prefix=settings.API_PREFIX, tags=["Automat
 app.include_router(contacts.router, prefix=settings.API_PREFIX, tags=["Contacts"])
 app.include_router(campaigns_router, prefix=settings.API_PREFIX, tags=["Campaigns"])
 app.include_router(tasks_router, prefix=settings.API_PREFIX, tags=["Tasks"])
+app.include_router(integrations_router, prefix=settings.API_PREFIX, tags=["Integrations"])
 app.include_router(gmail_router, prefix=settings.API_PREFIX)
 app.include_router(permissions_router, prefix=settings.API_PREFIX, tags=["Permissions & Audit"])
 

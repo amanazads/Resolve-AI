@@ -7,13 +7,14 @@ import ChatInput from './components/ChatInput';
 import AgentInspector from './components/AgentInspector';
 import SupportWidget from './components/SupportWidget';
 import WorkspaceShell from './components/workspace/WorkspaceShell';
-import { sendChatMessage, escalateSession } from './services/api';
+import { sendChatMessage, escalateSession, getCurrentUser } from './services/api';
 import { useVoice } from './hooks/useVoice';
 
 const generateSessionId = () => 'sess_' + Math.random().toString(36).substring(2, 9);
-const USER_ID = 'user123';
 
 export default function App() {
+  const currentUser = getCurrentUser();
+  const userId = currentUser?.id || 'local_user';
   const [sessionId, setSessionId] = useState(generateSessionId());
   const [messages, setMessages] = useState([]);
   const [loading, setLoading] = useState(false);
@@ -78,7 +79,7 @@ export default function App() {
     setLoading(true);
 
     try {
-      const data = await sendChatMessage(sessionId, USER_ID, text);
+      const data = await sendChatMessage(sessionId, userId, text);
       const assistantMsg = {
         role: 'assistant',
         content: data.response,
@@ -122,7 +123,7 @@ export default function App() {
   const handleManualEscalate = async () => {
     if (isEscalated) return;
     try {
-      await escalateSession(sessionId, USER_ID, 'User requested human support');
+      await escalateSession(sessionId, userId, 'User requested human support');
       setIsEscalated(true);
       setMessages((prev) => [
         ...prev,

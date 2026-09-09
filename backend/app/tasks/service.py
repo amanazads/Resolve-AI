@@ -44,6 +44,9 @@ class TaskService:
         if not task_dict:
             return None
         task = ExecutionTask.model_validate(task_dict)
+        if task.status == TaskStatus.PAUSED:
+            task.status = TaskStatus.RUNNING if task.actions else TaskStatus.PLANNING
+            await db_manager.save_task(task.model_dump(mode="json"))
         return await TaskAgent.step_task(task)
 
     @classmethod
@@ -67,6 +70,10 @@ class TaskService:
             return None
         task = ExecutionTask.model_validate(task_dict)
         task.status = TaskStatus.CANCELLED
+        from app.tasks.models import ActionStatus
+        for action in task.actions:
+            if action.status in (ActionStatus.PENDING, ActionStatus.QUEUED, ActionStatus.RUNNING):
+                action.status = ActionStatus.CANCELLED
         await db_manager.save_task(task.model_dump(mode="json"))
         return task
 

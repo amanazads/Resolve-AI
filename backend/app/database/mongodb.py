@@ -63,6 +63,46 @@ class MongoDBManager:
             self.client.close()
             logger.info("Closed MongoDB client connection.")
 
+    async def clear_all_test_data(self):
+        """Cleans all test data from both in-memory structures and live MongoDB database."""
+        for attr in (
+            "_memory_messages",
+            "_memory_escalations",
+            "_memory_plans",
+            "_memory_campaigns",
+            "_memory_jobs",
+            "_memory_idempotency",
+            "_memory_contacts",
+            "_memory_datasets",
+            "_memory_integrations",
+            "_memory_campaign_jobs",
+            "_memory_campaign_progress",
+            "_memory_automation_runs",
+            "_memory_permissions",
+            "_memory_audit",
+            "_memory_suppressions",
+            "_memory_safety_audits",
+            "_memory_campaign_activities",
+            "_memory_tasks",
+            "_memory_task_jobs",
+            "_memory_task_events",
+        ):
+            store = getattr(self, attr, None)
+            if store is not None and hasattr(store, "clear"):
+                store.clear()
+
+        if self.is_connected and self.db is not None:
+            try:
+                collections = [
+                    "tasks", "task_jobs", "task_events", "contacts", "datasets",
+                    "permissions", "audit_log", "suppressions", "campaigns", "jobs", "idempotency"
+                ]
+                for coll in collections:
+                    await self.db[coll].delete_many({})
+            except Exception as e:
+                logger.warning(f"Error clearing test collections: {e}")
+
+
     # ==================== Index Management ====================
 
     async def _ensure_all_indexes(self):
@@ -156,15 +196,18 @@ class MongoDBManager:
             "tasks": [
                 [("task_id", 1)],
                 [("user_id", 1), ("created_at", -1)],
-                [("status", 1)],
+                [("status", 1), ("created_at", -1)],
             ],
             "task_jobs": [
                 [("job_id", 1)],
-                [("task_id", 1)],
+                [("task_id", 1), ("status", 1)],
                 [("idempotency_key", 1)],
+                [("status", 1), ("created_at", 1)],
+                [("lease_expires_at", 1)],
             ],
             "task_events": [
                 [("task_id", 1), ("timestamp", -1)],
+                [("event_id", 1)],
             ],
             # ---- chat messages ----
             "messages": [
