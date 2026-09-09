@@ -43,6 +43,7 @@ from app.tasks.models import (
 )
 from app.tasks.planner import TaskPlanner
 from app.tasks.tools import ToolRegistry
+from app.integrations.registry import get_email_provider
 
 logger = logging.getLogger(__name__)
 
@@ -158,7 +159,8 @@ class TaskAgent:
             return None
 
         task = ExecutionTask.model_validate(task_dict)
-        provider_name = (settings.EMAIL_PROVIDER or "mock").lower()
+        provider = get_email_provider()
+        provider_name = (provider.name if provider else settings.EMAIL_PROVIDER or "mock").lower()
 
         # Create server-side permission grant
         grant = await permission_service.grant(
@@ -805,7 +807,8 @@ class TaskAgent:
             return False
 
         enforcer = PermissionEnforcer()
-        provider_name = (settings.EMAIL_PROVIDER or "mock").lower()
+        provider = get_email_provider()
+        provider_name = (provider.name if provider else settings.EMAIL_PROVIDER or "mock").lower()
 
         # If client provided pre-authorization, record real server-side grant
         if task.authorization_scope.get("allow_send") is True:
@@ -880,7 +883,8 @@ class TaskAgent:
             # Immediate revocation check for actions requiring authorization
             if action.requires_authorization and not task.dry_run:
                 enforcer = PermissionEnforcer()
-                provider_name = (settings.EMAIL_PROVIDER or "mock").lower()
+                provider = get_email_provider()
+                provider_name = (provider.name if provider else settings.EMAIL_PROVIDER or "mock").lower()
                 auth_check = await enforcer.check(
                     user_id=task.user_id,
                     scope=PermissionScope.EMAIL_SEND,

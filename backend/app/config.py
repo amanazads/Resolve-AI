@@ -51,9 +51,9 @@ class Settings(BaseSettings):
     HF_TOKEN: str = ""
 
     # ==================== Outbound Email ====================
-    # Which provider the application sends through: "mock" (default, local dev,
-    # nothing leaves the process) or "gmail" (Gmail API over OAuth 2.0).
-    EMAIL_PROVIDER: str = "mock"
+    # Which provider the application sends through: "gmail" (default production / OAuth)
+    # or "mock" (automated tests and simulation).
+    EMAIL_PROVIDER: str = "gmail"
 
     # ---- Google Cloud OAuth 2.0 client (Web application credentials) --------
     GOOGLE_CLIENT_ID: str = ""

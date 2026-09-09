@@ -369,6 +369,12 @@ export const cancelTask = async (taskId) =>
 export const getTaskJobs = async (taskId) =>
   unwrap(client.get(`/tasks/${taskId}/jobs`));
 
+export const getTaskActivity = async (taskId) =>
+  unwrap(client.get(`/tasks/${taskId}/activity`));
+
+export const getDiagnostics = async () =>
+  unwrap(client.get('/integrations/diagnostics'));
+
 export const getTaskEventsUrl = (taskId) => {
   if (API_BASE.startsWith('http')) {
     return `${API_BASE}/tasks/${taskId}/events`;

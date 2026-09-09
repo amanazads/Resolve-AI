@@ -80,7 +80,11 @@ class TaskService:
     @classmethod
     async def get_task(cls, task_id: str) -> Optional[ExecutionTask]:
         task_dict = await db_manager.get_task(task_id)
-        return ExecutionTask.model_validate(task_dict) if task_dict else None
+        if not task_dict:
+            return None
+        events = await db_manager.get_task_events(task_id, limit=100)
+        task_dict["events"] = events
+        return ExecutionTask.model_validate(task_dict)
 
     @classmethod
     async def list_tasks(
